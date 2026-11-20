@@ -71,13 +71,21 @@ def judge(prompt, answer):
               'Reply with JSON only: {"valid": true/false, "name": "properly spelled common name of what they meant", '
               '"rarity": 1-5 (1 = one of the first answers most people give, 3 = decent but not obvious, 5 = almost nobody would think of it), '
               '"reason": "if invalid, under 12 words"}')
-    body = json.dumps({'model': GROQ_MODEL, 'temperature': 0, 'max_tokens': 120, 'response_format': {'type': 'json_object'},
-                       'messages': [{'role': 'system', 'content': system},
-                                    {'role': 'user', 'content': f'Category: "{prompt}"\nPlayer typed: "{answer}"'}]}).encode()
-    req = urllib.request.Request('https://api.groq.com/openai/v1/chat/completions', data=body,
-                                 headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json', 'User-Agent': 'benthic'})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        out = json.load(r)
+    global GROQ_MODEL
+    models = [GROQ_MODEL] + [m for m in ('llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b') if m != GROQ_MODEL]
+    for i, model in enumerate(models):
+        body = json.dumps({'model': model, 'temperature': 0, 'max_tokens': 120, 'response_format': {'type': 'json_object'},
+                           'messages': [{'role': 'system', 'content': system},
+                                        {'role': 'user', 'content': f'Category: "{prompt}"\nPlayer typed: "{answer}"'}]}).encode()
+        req = urllib.request.Request('https://api.groq.com/openai/v1/chat/completions', data=body,
+                                     headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json', 'User-Agent': 'benthic'})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                out = json.load(r)
+            GROQ_MODEL = model
+            break
+        except urllib.error.HTTPError as e:
+            if e.code not in (400, 404) or i == len(models) - 1: raise
     v = json.loads(out['choices'][0]['message']['content'])
     return {'valid': bool(v.get('valid')), 'name': str(v.get('name', ''))[:60],
             'rarity': max(1, min(5, int(v.get('rarity') or 3))), 'reason': str(v.get('reason', ''))[:120]}
