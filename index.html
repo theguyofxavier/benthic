@@ -46372,7 +46372,7 @@ function renderSettings() {
   const key = { '#set-timer': 'timer', '#set-sound': 'sound', '#set-fx': 'fx', '#set-music': 'music' }[sel];
   S[key] = +b.dataset.v; saveS(); renderSettings(); if (key === 'fx') FX.reseed(); if (key === 'sound') { updateSnd(); } if (key === 'music') { SND.init(); PROG.music(!!S.music); }
 }));
-$('#set-judge').addEventListener('change', e => { const v = e.target.value.trim(); store.set('judgeUrl', v); toast(v ? 'Judge server saved' : 'Judge server cleared'); });
+$('#set-judge').addEventListener('change', e => { const v = e.target.value.trim().replace(/\/+$/, '').replace(/\/judge$/i, '').replace(/^(?!https?:\/\/)(?=.)/i, 'https://'); e.target.value = v; store.set('judgeUrl', v); toast(v ? 'Judge server saved' : 'Judge server cleared'); });
 $('#reset-seen').addEventListener('click', () => { store.set('seen', []); renderSettings(); toast('Endless history cleared'); });
 function updateSnd() { $('#snd-wave').style.opacity = S.sound ? 1 : 0.15; }
 $('#snd-btn').addEventListener('click', () => { SND.init(); S.sound = S.sound ? 0 : 1; saveS(); updateSnd(); toast(S.sound ? 'Sound on' : 'Sound off'); });
@@ -46556,7 +46556,8 @@ const MP = (() => {
 const JUDGE_URL = 'https://computer.tail82797f.ts.net';   // your Pi's https://….ts.net address, baked in for the HTML file
 const AI = (() => {
   let s = null, off = false, cool = 0;
-  const url = () => (store.get('judgeUrl', '') || (typeof NET !== 'undefined' && NET.available() ? NET.base() : JUDGE_URL)).replace(/\/+$/, '');
+  const fix = u => { u = (u || '').trim().replace(/\/+$/, '').replace(/\/judge$/i, ''); if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u; return u; };
+  const url = () => fix(store.get('judgeUrl', '')) || fix(typeof NET !== 'undefined' && NET.available() ? NET.base() : JUDGE_URL);
   try {
     const P = (window.claude && typeof window.claude.use === 'function') ? window.claude.use('sample') : null;
     if (P) P.then(x => { s = x; }).catch(() => { });
