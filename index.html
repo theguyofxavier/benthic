@@ -46779,7 +46779,8 @@ PROG.renderBadge();
 const ONLINE_URL = 'https://computer.tail82797f.ts.net';
 const NET = (() => {
   const host = location.hostname;
-  const base = /\.ts\.net$/.test(host) || host === 'localhost' || host === '127.0.0.1' ? location.origin : '';
+  const base = /\.ts\.net$/.test(host) || host === 'localhost' || host === '127.0.0.1' ? location.origin
+    : /claude\.ai$|claudeusercontent|anthropic/.test(host) ? '' : ONLINE_URL;  // a downloaded .html talks to the Pi directly
   let token = store.get('token', ''), me = store.get('me', '');
   const _set = store.set.bind(store);
   const SKIP = new Set(['token', 'me', 'settings', 'judgeUrl', 'mpname']);
