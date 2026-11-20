@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, frm INTEGER, too INT
 CREATE TABLE IF NOT EXISTS scores(uid INTEGER, day INTEGER, depth INTEGER, sq TEXT, t REAL, PRIMARY KEY(uid, day));
 CREATE INDEX IF NOT EXISTS msg_pair ON messages(frm, too, id);
 ''')
+try: db.execute('ALTER TABLE users ADD COLUMN rcode TEXT')
+except sqlite3.OperationalError: pass
+def new_code():
+    a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    return '-'.join(''.join(secrets.choice(a) for _ in range(4)) for _ in range(3))
+def code_hash(c): return hashlib.sha256(re.sub(r'[^A-Z0-9]', '', c.upper()).encode()).hexdigest()
 
 def q(sql, args=(), one=False):
     with db_lock:
@@ -205,12 +211,32 @@ class H(BaseHTTPRequestHandler):
                 if len(pw) < 6: return self.reply(400, {'error': 'Password needs at least 6 characters.'})
                 if q('SELECT id FROM users WHERE name=?', (name,), one=True): return self.reply(409, {'error': 'That username is taken.'})
                 salt = secrets.token_hex(16)
-                q('INSERT INTO users(name,pw,salt,created,seen) VALUES(?,?,?,?,?)', (name, hash_pw(pw, salt), salt, time.time(), time.time()))
-                return self.login(name, pw)
+                code = new_code()
+                q('INSERT INTO users(name,pw,salt,created,seen,rcode) VALUES(?,?,?,?,?,?)', (name, hash_pw(pw, salt), salt, time.time(), time.time(), code_hash(code)))
+                return self.login(name, pw, {'recovery': code})
             if path == '/api/login' and method == 'POST':
                 if limited('l:' + self.ip(), 10): return self.reply(429, {'error': 'Too many tries, wait a minute.'})
                 b = self.body(5000)
                 return self.login(str(b.get('name', '')).strip(), str(b.get('password', '')))
+            m = re.match(r'^/api/lobby/([a-z0-9][a-z0-9_.-]{0,47})$', path)
+            if m and method == 'POST':
+                b = self.body(6000)
+                peer = str(b.get('peer', ''))[:40]
+                if not peer: return self.reply(400, {'error': 'no peer'})
+                pres = b.get('presence') if not b.get('leave') else None
+                if pres is not None and len(json.dumps(pres)) > 4096: return self.reply(413, {'error': 'too big'})
+                return self.reply(200, {'peers': lobby_sync(m.group(1), peer, pres)})
+            if path == '/api/reset' and method == 'POST':
+                if limited('r:' + self.ip(), 6): return self.reply(429, {'error': 'Too many tries, wait a minute.'})
+                b = self.body(5000); name, code, pw = str(b.get('name', '')).strip(), str(b.get('code', '')), str(b.get('password', ''))
+                u = q('SELECT * FROM users WHERE name=?', (name,), one=True)
+                if not u or not u['rcode'] or not hmac.compare_digest(u['rcode'], code_hash(code)):
+                    return self.reply(401, {'error': 'That username and recovery code don’t match.'})
+                if len(pw) < 6: return self.reply(400, {'error': 'Password needs at least 6 characters.'})
+                salt = secrets.token_hex(16); code2 = new_code()
+                q('UPDATE users SET pw=?, salt=?, rcode=? WHERE id=?', (hash_pw(pw, salt), salt, code_hash(code2), u['id']))
+                q('DELETE FROM sessions WHERE uid=?', (u['id'],))
+                return self.login(u['name'], pw, {'recovery': code2})
             u = self.user()
             if not u:
                 return self.reply(401, {'error': 'Not signed in.'})
@@ -219,6 +245,48 @@ class H(BaseHTTPRequestHandler):
                 a = self.headers.get('Authorization', '')[7:]
                 q('DELETE FROM sessions WHERE token=?', (tok_hash(a),))
                 return self.reply(200, {'ok': True})
+            if path == '/api/password' and method == 'POST':
+                b = self.body(5000); old_pw, pw = str(b.get('old', '')), str(b.get('password', ''))
+                if not hmac.compare_digest(u['pw'], hash_pw(old_pw, u['salt'])): return self.reply(403, {'error': 'Your current password is wrong.'})
+                if len(pw) < 6: return self.reply(400, {'error': 'Password needs at least 6 characters.'})
+                salt = secrets.token_hex(16)
+                q('UPDATE users SET pw=?, salt=? WHERE id=?', (hash_pw(pw, salt), salt, uid))
+                cur = tok_hash(self.headers.get('Authorization', '')[7:])
+                q('DELETE FROM sessions WHERE uid=? AND token<>?', (uid, cur))
+                return self.reply(200, {'ok': True})
+            if path == '/api/recovery' and method == 'POST':
+                b = self.body(5000)
+                if not hmac.compare_digest(u['pw'], hash_pw(str(b.get('password', '')), u['salt'])): return self.reply(403, {'error': 'Wrong password.'})
+                code = new_code(); q('UPDATE users SET rcode=? WHERE id=?', (code_hash(code), uid))
+                return self.reply(200, {'recovery': code})
+            if path == '/api/account' and method == 'DELETE':
+                b = self.body(5000)
+                if not hmac.compare_digest(u['pw'], hash_pw(str(b.get('password', '')), u['salt'])): return self.reply(403, {'error': 'Wrong password.'})
+                for sql in ('DELETE FROM sessions WHERE uid=?', 'DELETE FROM scores WHERE uid=?', 'DELETE FROM users WHERE id=?'):
+                    q(sql, (uid,))
+                q('DELETE FROM friends WHERE a=? OR b=?', (uid, uid)); q('DELETE FROM messages WHERE frm=? OR too=?', (uid, uid))
+                return self.reply(200, {'ok': True})
+            if path == '/api/board' and method == 'GET':
+                kind, day = qs.get('kind', 'xp'), int(qs.get('day', '0') or 0)
+                ids = [r['b'] for r in q("SELECT b FROM friends WHERE a=? AND status='ok'", (uid,))] + [uid]
+                ph = ','.join('?' * len(ids))
+                if kind == 'week':
+                    rows = q(f'SELECT u.id, u.name, u.level, COALESCE(SUM(s.depth),0) v, COUNT(s.day) n FROM users u LEFT JOIN scores s ON s.uid=u.id AND s.day>? AND s.day<=? WHERE u.id IN ({ph}) GROUP BY u.id ORDER BY v DESC', (day - 7, day, *ids))
+                elif kind == 'best':
+                    rows = q(f'SELECT u.id, u.name, u.level, COALESCE(MAX(s.depth),0) v, COUNT(s.day) n FROM users u LEFT JOIN scores s ON s.uid=u.id WHERE u.id IN ({ph}) GROUP BY u.id ORDER BY v DESC', ids)
+                elif kind == 'streak':
+                    rows = []
+                    for i in ids:
+                        us = q('SELECT id, name, level FROM users WHERE id=?', (i,), one=True)
+                        if not us: continue
+                        days = {r['day'] for r in q('SELECT day FROM scores WHERE uid=? AND day>?', (i, day - 400))}
+                        d, n = (day if day in days else day - 1), 0
+                        while d in days: n += 1; d -= 1
+                        rows.append({'id': us['id'], 'name': us['name'], 'level': us['level'], 'v': n, 'n': len(days)})
+                    rows.sort(key=lambda r: -r['v'])
+                else:
+                    rows = q(f'SELECT id, name, level, xp v, 0 n FROM users WHERE id IN ({ph}) ORDER BY xp DESC', ids)
+                return self.reply(200, {'rows': [{'name': r['name'], 'level': r['level'], 'v': r['v'], 'n': r['n'], 'me': r['id'] == uid} for r in rows]})
             if path == '/api/me' and method == 'GET':
                 return self.reply(200, {'name': u['name'], 'data': json.loads(u['data'] or '{}')})
             if path == '/api/save' and method == 'PUT':
@@ -283,14 +351,6 @@ class H(BaseHTTPRequestHandler):
                 rows = q('SELECT id, frm, text, t FROM messages WHERE ((frm=? AND too=?) OR (frm=? AND too=?)) AND id>? ORDER BY id DESC LIMIT 80', (uid, oid, oid, uid, after))
                 q('UPDATE messages SET read=1 WHERE frm=? AND too=?', (oid, uid))
                 return self.reply(200, {'messages': [{'id': r['id'], 'mine': r['frm'] == uid, 'text': r['text'], 't': r['t']} for r in reversed(rows)]})
-            m = re.match(r'^/api/lobby/([a-z0-9][a-z0-9_.-]{0,47})$', path)
-            if m and method == 'POST':
-                b = self.body(6000)
-                peer = str(b.get('peer', ''))[:40]
-                if not peer: return self.reply(400, {'error': 'no peer'})
-                pres = b.get('presence') if not b.get('leave') else None
-                if pres is not None and len(json.dumps(pres)) > 4096: return self.reply(413, {'error': 'too big'})
-                return self.reply(200, {'peers': lobby_sync(m.group(1), peer, pres)})
             return self.reply(404, {'error': 'not found'})
         except urllib.error.HTTPError as e:
             self.reply(502, {'error': f'ai {e.code}'})
@@ -299,13 +359,13 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self.reply(500, {'error': type(e).__name__})
 
-    def login(self, name, pw):
+    def login(self, name, pw, extra=None):
         u = q('SELECT * FROM users WHERE name=?', (name,), one=True)
         if not u or not hmac.compare_digest(u['pw'], hash_pw(pw, u['salt'])):
             return self.reply(401, {'error': 'Wrong username or password.'})
         t = secrets.token_urlsafe(32)
         q('INSERT INTO sessions(token,uid,created) VALUES(?,?,?)', (tok_hash(t), u['id'], time.time()))
-        return self.reply(200, {'token': t, 'name': u['name'], 'data': json.loads(u['data'] or '{}')})
+        return self.reply(200, dict({'token': t, 'name': u['name'], 'data': json.loads(u['data'] or '{}')}, **(extra or {})))
 
 # restart automatically when an update lands (systemd brings us back up)
 def watch_updates():
@@ -319,6 +379,13 @@ def watch_updates():
             print('update landed, restarting', flush=True)
             os._exit(0)
 
+if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == 'reset-password':
+    # on the Pi:  python3 ~/benthic-online/server.py reset-password USERNAME NEWPASSWORD
+    u = q('SELECT id FROM users WHERE name=?', (sys.argv[2],), one=True)
+    if not u: sys.exit('No user called ' + sys.argv[2])
+    salt = secrets.token_hex(16)
+    q('UPDATE users SET pw=?, salt=? WHERE id=?', (hash_pw(sys.argv[3], salt), salt, u['id'])); q('DELETE FROM sessions WHERE uid=?', (u['id'],))
+    print('Password reset for', sys.argv[2]); sys.exit(0)
 if __name__ == '__main__':
     threading.Thread(target=watch_updates, daemon=True).start()
     print(f'Benthic Online on 127.0.0.1:{PORT} (judge: {"on" if GROQ_KEY else "off"}, model {GROQ_MODEL})', flush=True)
