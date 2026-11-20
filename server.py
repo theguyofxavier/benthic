@@ -58,6 +58,18 @@ def limited(key, per_min):
     return False
 
 # ---------- AI judge ----------
+def available_models():
+    req = urllib.request.Request('https://api.groq.com/openai/v1/models',
+                                 headers={'Authorization': f'Bearer {GROQ_KEY}', 'User-Agent': 'benthic'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        ids = [m['id'] for m in json.load(r).get('data', []) if m.get('active', True)]
+    bad = ('whisper', 'tts', 'guard', 'embed', 'vision', 'audio', 'orpheus', 'prompt', 'compound')
+    ids = [i for i in ids if not any(x in i.lower() for x in bad)]
+    def score(i):
+        l = i.lower()
+        return ('llama' in l) * 3 + ('70b' in l or '120b' in l or 'maverick' in l) * 2 + ('versatile' in l) + ('instant' in l) * 0.5
+    return sorted(ids, key=score, reverse=True)[:6]
+
 def judge(prompt, answer):
     today = time.strftime('%Y-%m-%d')
     if day_count['d'] != today:
@@ -72,21 +84,34 @@ def judge(prompt, answer):
               '"rarity": 1-5 (1 = one of the first answers most people give, 3 = decent but not obvious, 5 = almost nobody would think of it), '
               '"reason": "if invalid, under 12 words"}')
     global GROQ_MODEL
-    models = [GROQ_MODEL] + [m for m in ('llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b') if m != GROQ_MODEL]
-    for i, model in enumerate(models):
-        body = json.dumps({'model': model, 'temperature': 0, 'max_tokens': 120, 'response_format': {'type': 'json_object'},
-                           'messages': [{'role': 'system', 'content': system},
-                                        {'role': 'user', 'content': f'Category: "{prompt}"\nPlayer typed: "{answer}"'}]}).encode()
-        req = urllib.request.Request('https://api.groq.com/openai/v1/chat/completions', data=body,
+    def call(model, fmt=True):
+        payload = {'model': model, 'temperature': 0, 'max_tokens': 300,
+                   'messages': [{'role': 'system', 'content': system},
+                                {'role': 'user', 'content': f'Category: "{prompt}"\nPlayer typed: "{answer}"'}]}
+        if fmt: payload['response_format'] = {'type': 'json_object'}
+        req = urllib.request.Request('https://api.groq.com/openai/v1/chat/completions', data=json.dumps(payload).encode(),
                                      headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json', 'User-Agent': 'benthic'})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                out = json.load(r)
-            GROQ_MODEL = model
-            break
-        except urllib.error.HTTPError as e:
-            if e.code not in (400, 404) or i == len(models) - 1: raise
-    v = json.loads(out['choices'][0]['message']['content'])
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.load(r)
+    try:
+        out = call(GROQ_MODEL)
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 404): raise
+        detail = e.read()[:300].decode('utf-8', 'replace')
+        print(f'judge: model {GROQ_MODEL} failed {e.code}: {detail}', flush=True)
+        out = None
+        for model in available_models():
+            for fmt in (True, False):
+                try:
+                    out = call(model, fmt); GROQ_MODEL = model
+                    print(f'judge: switched to {model}', flush=True); break
+                except urllib.error.HTTPError as e2:
+                    print(f'judge: {model} fmt={fmt} failed {e2.code}', flush=True)
+            if out: break
+        if not out: raise
+    txt = out['choices'][0]['message']['content'] or ''
+    txt = txt[txt.find('{'):txt.rfind('}') + 1]
+    v = json.loads(txt)
     return {'valid': bool(v.get('valid')), 'name': str(v.get('name', ''))[:60],
             'rarity': max(1, min(5, int(v.get('rarity') or 3))), 'reason': str(v.get('reason', ''))[:120]}
 
@@ -163,7 +188,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-cache'); self.end_headers(); self.wfile.write(data)
                 return
             if path == '/api/health':
-                return self.reply(200, {'ok': True, 'judge': bool(GROQ_KEY)})
+                return self.reply(200, {'ok': True, 'judge': bool(GROQ_KEY), 'model': GROQ_MODEL})
             if limited(self.ip(), 240):
                 return self.reply(429, {'error': 'Slow down a bit.'})
             if path == '/judge' and method == 'POST':
