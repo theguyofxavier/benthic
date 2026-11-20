@@ -1,0 +1,3 @@
+.env
+benthic.db*
+__pycache__/
