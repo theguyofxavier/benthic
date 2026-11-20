@@ -97,6 +97,9 @@ h1.title em{font-style:italic;color:var(--foam)}
 .field input::placeholder{color:rgba(233,243,242,.28);font-style:italic}
 .field .enter{position:absolute;right:0;bottom:16px;font:11px var(--mono);color:var(--mute);border:1px solid var(--line);border-radius:6px;padding:4px 7px}
 .field.shake{animation:shake .42s}
+.field.stutter{animation:stutter 1.1s steps(1,end) infinite;opacity:.85}
+.field.stutter input{color:var(--faint)}
+@keyframes stutter{0%{transform:translate(0,0)}9%{transform:translate(-2px,1px)}14%{transform:translate(1px,-1px)}22%{transform:translate(0,0)}48%{transform:translate(2px,0)}53%{transform:translate(-1px,1px)}60%{transform:translate(0,0)}78%{transform:translate(-1px,0)}84%{transform:translate(1px,1px)}90%{transform:translate(0,0)}}
 @keyframes shake{20%,60%{transform:translateX(-9px)}40%,80%{transform:translateX(9px)}}
 .msg{min-height:44px;margin-top:14px;font-size:15px;line-height:1.45;color:var(--mute)}
 .msg.bad{color:#ffb4a0}
@@ -347,7 +350,7 @@ h1.title em{font-style:italic;color:var(--foam)}
   <button class="iconbtn close" data-close><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
   <h2>How the dive works</h2>
   <p>Each prompt has many correct answers. Type one before your air runs out. If an answer is rejected you can keep trying until the timer ends. Autocorrect is generous: typos and sound-alike spellings get fixed (“cryllion” finds Krill), extra describing words are ignored (“chinese beetle” counts as Beetle, “yellow tomato” as Tomato), and the first word of a long answer is enough when it’s clear which one you mean. If your spelling is close to two answers, you pick.</p><p>After you submit, your answer sinks down the tier ladder, slows, and teeters over the next tier before it lands. Press Enter to skip the animation.</p>
-  <p>Answers are ranked from most to least common. The rarer your answer, the more points you score, and every point takes you 10 metres deeper. A perfect daily dive reaches 7,000 m.</p><p>Not on our list? An AI judge checks your answer and, if it’s real, scores it by how rare it is. In Endless, Rare-or-better answers in a row build a combo that multiplies your depth.</p><p>Autocorrect always asks first: if your spelling is close, you get “Do you want it to correct to …?”. Press Enter or Yes to accept, No to retype.</p>
+  <p>Answers are ranked from most to least common. The rarer your answer, the more points you score, and every point takes you 10 metres deeper. A perfect daily dive reaches 7,000 m.</p><p>Real answers count even when they’re obscure, scored by how rare they are. In Endless, Rare-or-better answers in a row build a combo that multiplies your depth.</p><p>Autocorrect always asks first: if your spelling is close, you get “Do you want it to correct to …?”. Press Enter or Yes to accept, No to retype.</p>
   <div class="tl" id="tier-legend"></div>
   <p><b style="color:var(--ink)">Too Clever</b> is for answers everyone reaches for when they’re trying to be obscure (Liechtenstein, platypus, kumquat). They’re still correct, just not rare.</p>
   <p>Some tempting wrong answers are flagged on purpose, like a spider for “insect” or Pluto for “planet”, so you get told exactly why instead of a silent fail. Rankings come from hand-curated lists plus word-frequency data across about 42,000 answers, so the odd valid answer might be missing.</p>
@@ -46048,25 +46051,49 @@ function startTimer(secs, leftMs) {
     num.textContent = s;
     const low = left < 5000; tEl.classList.toggle('low', low); tn.classList.toggle('low', low);
     if (s !== lastSec) { lastSec = s; if (low && s > 0) SND.tick(); }
-    if (left <= 0) { timer = null; if (G && G.mode === 'speed') { G.speedEnd = 0; if (phase === 'ask') miss('Time!'); return; } return timeout(); }
+    if (left <= 0) { timer = null; if (G && G.mode === 'speed') { G.speedEnd = 0; if (phase === 'ask' || phase === 'holding') { $('#field').classList.remove('stutter'); $('#inp').disabled = false; miss('Time!'); } return; } return timeout(); }
     timer.raf = requestAnimationFrame(loop);
   };
   timer.raf = requestAnimationFrame(loop);
 }
 
-function submit() {
+// Every answer gets the same "stutter" before anything shows, whether it's an exact hit, a correction offer,
+// or something being checked in the background, so you can never tell which one happened from the timing.
+const HOLD_MS = () => G.mode === 'speed' ? 420 + Math.random() * 200 : 1050 + Math.random() * 500;
+async function hold(work) {
+  const held = G.mode === 'speed' ? null : pauseTimer();
+  phase = 'holding';
+  const inp = $('#inp'), f = $('#field'), pid = G.pid;
+  inp.disabled = true; $('#msg').className = 'msg'; $('#msg').innerHTML = '';
+  f.classList.remove('shake'); f.classList.add('stutter'); SND.tick && SND.tick();
+  let v = null;
+  const [, out] = await Promise.all([sleep(HOLD_MS()), (work || Promise.resolve(null)).catch(() => null)]);
+  v = out;
+  f.classList.remove('stutter');
+  if (!G || G.pid !== pid || phase !== 'holding') return { stale: true };
+  phase = 'ask'; inp.disabled = false; inp.focus(); resumeTimer(held);
+  return { v };
+}
+function aiWork(p, raw) { G.aiTries = (G.aiTries || 0) + 1; return AI.judge(p[1], raw); }
+const NOPE = raw => `Couldn’t find “${esc(raw)}” among the accepted answers. Check the spelling or try something else.`;
+
+async function submit() {
   if (phase !== 'ask') return;
   const raw = $('#inp').value.trim();
   if (!raw) return;
   const p = PROMPTS[G.pid], r = judge(p, raw);
-  const msg = $('#msg');
   G.tries++;
+  const decoyOrRule = r.type === 'reject' && (!/^Looks like/.test(r.msg) && (LISTS[p[0]].items[r.i][2].includes('~') || p[2] === 'start' || p[2] === 'base'));
+  const wantAI = r.type !== 'ok' && r.type !== 'ambiguous' && AI.ready() && !decoyOrRule && (G.aiTries || 0) < 3;
+  const h = await hold(wantAI ? aiWork(p, raw) : null);
+  if (h.stale) return;
+  const msg = $('#msg');
   if (r.type === 'ok' && !r.corrected) return resolve(r.i, raw, false);
   if (r.type === 'ok') {
     const nm = LISTS[p[0]].items[r.i][0];
     G.pending = { i: r.i, raw, how: r.how, extra: r.extra };
     msg.className = 'msg';
-    msg.innerHTML = `Do you want it to correct to <b style="color:var(--ink)">${esc(nm)}</b>?${r.how === 'extra' ? ` <span style="opacity:.7">(ignoring “${esc(r.extra)}”)</span>` : ''}<div class="opts"><button data-yes="1">Yes, ${esc(nm)} ↵</button><button data-no="1">No, let me retype</button>${AI.ready() ? `<button data-ai="1">No, I meant “${esc(raw)}”, ask the AI</button>` : ''}</div>`;
+    msg.innerHTML = `Do you want it to correct to <b style="color:var(--ink)">${esc(nm)}</b>?${r.how === 'extra' ? ` <span style="opacity:.7">(ignoring “${esc(r.extra)}”)</span>` : ''}<div class="opts"><button data-yes="1">Yes, ${esc(nm)} ↵</button><button data-no="1">No, let me retype</button>${AI.ready() && (G.aiTries || 0) < 3 ? `<button data-ai="1">No, I meant “${esc(raw)}”</button>` : ''}</div>`;
     return;
   }
   if (r.type === 'ambiguous') {
@@ -46074,9 +46101,8 @@ function submit() {
     msg.innerHTML = `Close to more than one answer. Which did you mean?<div class="opts">${r.options.map(i => `<button data-i="${i}">${esc(LISTS[p[0]].items[i][0])}</button>`).join('')}</div>`;
     return;
   }
-  const decoyOrRule = r.type === 'reject' && (!/^Looks like/.test(r.msg) && (LISTS[p[0]].items[r.i][2].includes('~') || p[2] === 'start' || p[2] === 'base'));
-  if (AI.ready() && !decoyOrRule && (G.aiTries || 0) < 3) return askAI(p, raw, r);
-  rejectMsg(r.type === 'reject' ? esc(r.msg) + ' Try another.' : `Couldn’t find “${esc(raw)}” among the accepted answers. Check the spelling or try something else.`);
+  if (wantAI) return applyAI(p, raw, r, h.v);
+  rejectMsg(r.type === 'reject' ? esc(r.msg) + ' Try another.' : NOPE(raw));
 }
 function rejectMsg(html) {
   const msg = $('#msg');
@@ -46085,25 +46111,20 @@ function rejectMsg(html) {
   SND.thud();
   $('#inp').disabled = false; $('#inp').select();
 }
-async function askAI(p, raw, local) {
-  G.aiTries = (G.aiTries || 0) + 1;
-  const held = G.mode === 'speed' ? null : pauseTimer();
-  phase = 'checking';
-  const msg = $('#msg'), inp = $('#inp'), pid = G.pid;
-  inp.disabled = true;
-  msg.className = 'msg'; msg.innerHTML = `<span class="aispin"></span>Not on our list, so the AI judge is checking “${esc(raw)}”…`;
-  let v = null;
-  try { v = await AI.judge(p[1], raw); } catch (e) { v = null; }
-  if (!G || G.pid !== pid || phase !== 'checking') return;
-  phase = 'ask'; inp.disabled = false; resumeTimer(held);
-  if (!v) return rejectMsg(local.type === 'reject' ? esc(local.msg) + ' Try another.' : `Couldn’t find “${esc(raw)}”, and the AI judge didn’t answer. Try something else.`);
-  if (!v.valid) return rejectMsg(`The AI judge says no${v.reason ? `: ${esc(String(v.reason).slice(0, 120))}` : '.'} Try another.`);
+function applyAI(p, raw, local, v) {
+  if (!v) return rejectMsg(local.type === 'reject' ? esc(local.msg) + ' Try another.' : NOPE(raw));
+  if (!v.valid) return rejectMsg(v.reason ? `“${esc(raw)}” doesn’t count: ${esc(String(v.reason).slice(0, 120))} Try another.` : NOPE(raw));
   const name = String(v.name || raw).slice(0, 60);
   const again = judge(p, name);
   if (again.type === 'ok') return resolve(again.i, raw, true, 'ai');
   if (again.type === 'reject' && (p[2] === 'start' || again.msg && LISTS[p[0]].items[again.i][2].includes('~'))) return rejectMsg(esc(again.msg) + ' Try another.');
   const rar = Math.max(1, Math.min(5, Math.round(+v.rarity || 3)));
   resolve(null, raw, true, 'ai', '', { name, tier: ['plankton', 'shoal', 'rare', 'deep', 'abyssal'][rar - 1] });
+}
+async function askAI(p, raw, local) {
+  const h = await hold(aiWork(p, raw));
+  if (h.stale) return;
+  applyAI(p, raw, local, h.v);
 }
 $('#msg').addEventListener('click', e => {
   if (phase !== 'ask') return;
@@ -46132,7 +46153,7 @@ function resolve(i, raw, corrected, how, extra, custom) {
   PROG.answer(tier, name, p, !!custom);
   $('#ask').style.display = 'none';
   const fixed = corrected && norm(raw, lst.strip) !== norm(name, lst.strip);
-  const note = how === 'ai' ? (custom ? 'not on our list, accepted by the AI judge' : `AI judge matched it to ${esc(name)}`) : !fixed ? '' : how === 'extra' ? `counted as ${esc(name)} (ignored “${esc(extra)}”)` : how === 'short' ? `counted as ${esc(name)}` : `autocorrected from “${esc(raw)}”`;
+  const note = how === 'ai' ? (custom || norm(raw, lst.strip) === norm(name, lst.strip) ? '' : `counted as ${esc(name)}`) : !fixed ? '' : how === 'extra' ? `counted as ${esc(name)} (ignored “${esc(extra)}”)` : how === 'short' ? `counted as ${esc(name)}` : `autocorrected from “${esc(raw)}”`;
   const rv = $('#reveal');
   rv.className = 'reveal on';
   rv.innerHTML = `
@@ -46531,7 +46552,7 @@ const MP = (() => {
     const rv = $('#reveal'); $('#ask').style.display = 'none'; rv.className = 'reveal on';
     rv.innerHTML = `<div class="eyebrow" style="margin-bottom:10px">Round ${st.r + 1} results</div><div class="mplist">${list.map(({ x, a }) => {
       const t = a && a.i >= 0 ? tierOf(p, a.i) : a && a.i === -2 ? TIERS.slice().reverse().find(tt => tt.pts <= (a.shared ? a.pts * 2 : a.pts)) : null;
-      return `<div class="mprow"><i style="background:${x.col}"></i><span style="min-width:110px">${esc(x.name)}</span><b class="mpans">${a && a.i >= 0 ? esc(lst.items[a.i][0]) : a && a.i === -2 ? esc(a.name) + ' <em>AI</em>' : '—'}</b><span class="t" style="color:${t ? t.color : 'var(--mute)'}">${t ? t.name : 'miss'}${a && a.shared ? ' · shared ½' : ''}</span><span class="p">+${a ? a.pts : 0}</span></div>`;
+      return `<div class="mprow"><i style="background:${x.col}"></i><span style="min-width:110px">${esc(x.name)}</span><b class="mpans">${a && a.i >= 0 ? esc(lst.items[a.i][0]) : a && a.i === -2 ? esc(a.name) : '—'}</b><span class="t" style="color:${t ? t.color : 'var(--mute)'}">${t ? t.name : 'miss'}${a && a.shared ? ' · shared ½' : ''}</span><span class="p">+${a ? a.pts : 0}</span></div>`;
     }).join('')}</div><div class="tnote" style="margin-top:14px">${st.r + 1 < ROUNDS ? 'Next prompt in a few seconds…' : 'Final scores coming up…'}</div>`;
     phase = 'mpwait';
   }
@@ -46612,7 +46633,7 @@ const PROG = (() => {
     ['abyssal10', 'Abyss Regular', 'Find 10 Abyssal answers'],
     ['abyssal50', 'Lives Down There', 'Find 50 Abyssal answers'],
     ['clever5', 'Not That Clever', 'Give 5 Too Clever answers'],
-    ['ai_find', 'Off the Map', 'Get an answer the AI judge accepted that wasn’t on our list'],
+    ['ai_find', 'Off the Map', 'Find a real answer that nobody else would think of'],
     ['perfect', 'Full Tank', 'Answer all 7 prompts in a daily dive'],
     ['deep_daily', 'Midnight Zone', 'Reach 4,000 m in a daily dive'],
     ['hadal_daily', 'Hadal', 'Reach 6,000 m in a daily dive'],
@@ -46719,7 +46740,7 @@ const PROG = (() => {
     const tabs = `<div class="seg ptabs"><button data-tab="ach" class="${tab === 'ach' ? 'on' : ''}">Achievements ${got}/${ACH.length}</button><button data-tab="codex" class="${tab === 'codex' ? 'on' : ''}">Codex ${codex.length}</button><button data-tab="stats" class="${tab === 'stats' ? 'on' : ''}">Stats</button></div>`;
     let body = '';
     if (tab === 'ach') body = `<div class="achgrid">${ACH.map(a => `<div class="ach ${P.ach[a[0]] ? 'got' : ''}"><b>${esc(a[1])}</b><span>${esc(a[2])}</span></div>`).join('')}</div>`;
-    if (tab === 'codex') body = codex.length ? `<p>Every Deep Cut, Abyssal and AI-approved find you’ve made.</p><div class="codex">${codex.map(c => `<div class="cx"><i style="background:${TIER[c.t].color}"></i><b>${esc(c.n)}</b><span>${esc(c.p)}${c.ai ? ' · AI judged' : ''}</span></div>`).join('')}</div>` : '<p>Nothing yet. Find a Deep Cut or Abyssal answer and it gets logged here.</p>';
+    if (tab === 'codex') body = codex.length ? `<p>Every Deep Cut and Abyssal find you’ve made.</p><div class="codex">${codex.map(c => `<div class="cx"><i style="background:${TIER[c.t].color}"></i><b>${esc(c.n)}</b><span>${esc(c.p)}</span></div>`).join('')}</div>` : '<p>Nothing yet. Find a Deep Cut or Abyssal answer and it gets logged here.</p>';
     if (tab === 'stats') {
       const st = store.get('stats', {});
       const row = (k, v) => `<div class="setrow"><span>${k}</span><b>${v}</b></div>`;
