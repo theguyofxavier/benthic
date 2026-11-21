@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, frm INTEGER, too INT
 CREATE TABLE IF NOT EXISTS scores(uid INTEGER, day INTEGER, depth INTEGER, sq TEXT, t REAL, PRIMARY KEY(uid, day));
 CREATE INDEX IF NOT EXISTS msg_pair ON messages(frm, too, id);
 ''')
+db.execute('CREATE TABLE IF NOT EXISTS answers(prompt TEXT, ans TEXT, n INTEGER, PRIMARY KEY(prompt, ans))')
 try: db.execute('ALTER TABLE users ADD COLUMN rcode TEXT')
 except sqlite3.OperationalError: pass
 def new_code():
@@ -226,6 +227,19 @@ class H(BaseHTTPRequestHandler):
                 pres = b.get('presence') if not b.get('leave') else None
                 if pres is not None and len(json.dumps(pres)) > 4096: return self.reply(413, {'error': 'too big'})
                 return self.reply(200, {'peers': lobby_sync(m.group(1), peer, pres)})
+            if path == '/api/answer' and method == 'POST':
+                if limited('a:' + self.ip(), 90): return self.reply(429, {'error': 'slow down'})
+                b = self.body(2000)
+                pr, an = str(b.get('p', ''))[:160], str(b.get('a', '')).strip().lower()[:60]
+                if not pr.startswith('Name ') or not an: return self.reply(400, {'error': 'bad request'})
+                q('INSERT INTO answers(prompt,ans,n) VALUES(?,?,1) ON CONFLICT(prompt,ans) DO UPDATE SET n=n+1', (pr, an))
+                return self.reply(200, {'ok': True})
+            if path == '/api/stats' and method == 'GET':
+                from urllib.parse import unquote
+                pr = unquote(qs.get('p', ''))[:160]
+                rows = q('SELECT ans, n FROM answers WHERE prompt=? ORDER BY n DESC LIMIT 400', (pr,))
+                tot = q('SELECT COALESCE(SUM(n),0) t FROM answers WHERE prompt=?', (pr,), one=True)['t']
+                return self.reply(200, {'total': tot, 'm': {r['ans']: r['n'] for r in rows}})
             if path == '/api/reset' and method == 'POST':
                 if limited('r:' + self.ip(), 6): return self.reply(429, {'error': 'Too many tries, wait a minute.'})
                 b = self.body(5000); name, code, pw = str(b.get('name', '')).strip(), str(b.get('code', '')), str(b.get('password', ''))
@@ -287,6 +301,19 @@ class H(BaseHTTPRequestHandler):
                 else:
                     rows = q(f'SELECT id, name, level, xp v, 0 n FROM users WHERE id IN ({ph}) ORDER BY xp DESC', ids)
                 return self.reply(200, {'rows': [{'name': r['name'], 'level': r['level'], 'v': r['v'], 'n': r['n'], 'me': r['id'] == uid} for r in rows]})
+            m = re.match(r'^/api/profile/([A-Za-z0-9_]{3,16})$', path)
+            if m and method == 'GET':
+                o = q('SELECT * FROM users WHERE name=?', (m.group(1),), one=True)
+                if not o: return self.reply(404, {'error': 'No one with that name.'})
+                fr = o['id'] == uid or q("SELECT 1 FROM friends WHERE a=? AND b=? AND status='ok'", (uid, o['id']), one=True)
+                if not fr: return self.reply(403, {'error': 'Only friends can see that profile.'})
+                d = json.loads(o['data'] or '{}'); pg = d.get('prog') or {}; st = d.get('stats') or {}
+                codex = sorted((pg.get('codex') or {}).values(), key=lambda c: -(c.get('d') or 0))
+                best = q('SELECT MAX(depth) v, COUNT(*) n FROM scores WHERE uid=?', (o['id'],), one=True)
+                return self.reply(200, {'name': o['name'], 'level': o['level'], 'xp': o['xp'], 'joined': o['created'], 'seen': o['seen'],
+                    'ach': len(pg.get('ach') or {}), 'codex': len(codex), 'finds': [{'n': c.get('n'), 'p': c.get('p'), 't': c.get('t')} for c in codex if c.get('t') in ('abyssal', 'deep')][:8],
+                    'answered': (pg.get('n') or {}).get('answers', 0), 'abyssal': (pg.get('n') or {}).get('abyssal', 0),
+                    'best': best['v'] or 0, 'dailies': best['n'] or 0, 'streak': st.get('streak', 0), 'endless': st.get('endless', 0), 'pressure': st.get('pressure', 0), 'skin': d.get('skin', '')})
             if path == '/api/me' and method == 'GET':
                 return self.reply(200, {'name': u['name'], 'data': json.loads(u['data'] or '{}')})
             if path == '/api/save' and method == 'PUT':
